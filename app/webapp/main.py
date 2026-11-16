@@ -15,7 +15,7 @@ from pydantic import BaseModel, Field
 from ..avro_codec import DEFAULT_SCHEMA_V1
 from . import db
 from .analyzer_client import ANALYZER_ORDER, build_clients
-from .services import GuardError, SwitchService
+from .services import GuardError, SourceConflictError, SwitchService
 
 DB_PATH = os.environ.get("WEBAPP_DB", "/data/webapp.db")
 WEB_DIR = Path(__file__).resolve().parent.parent.parent / "web"
@@ -82,6 +82,9 @@ class EventIn(BaseModel):
     measurement: Any = Field(None, alias="measurement_value")
     payload: Optional[Dict[str, Any]] = Field(
         None, description="完整 Avro record JSON；提供时优先于平铺字段")
+    source_key: Optional[str] = Field(
+        None, description="可选全局来源事件键：同键同内容重试返回首次事件；"
+                          "同键不同内容拒绝且不改旧事件")
     decode_on: Optional[List[str]] = Field(
         None, description="可选：提交后让指定分析服务实际解码")
 
@@ -146,6 +149,25 @@ def default_schema():
 
 # --- events -----------------------------------------------------------------
 
+def _ingest_response(result: Dict[str, Any], payload: Dict[str, Any],
+                     decode_on: Optional[List[str]]) -> Dict[str, Any]:
+    decodes = []
+    for analyzer_id in (decode_on or []):
+        if analyzer_id not in _analyzer_urls():
+            decodes.append({"analyzer_id": analyzer_id,
+                            "error": "unknown analyzer"})
+            continue
+        try:
+            decodes.append(service.decode_event(result["event_id"], analyzer_id))
+        except GuardError as exc:
+            decodes.append({"analyzer_id": analyzer_id, "error": str(exc)})
+        except Exception as exc:
+            decodes.append({"analyzer_id": analyzer_id,
+                            "error": f"decode call unconfirmed: {exc}"})
+    result["decodes"] = decodes
+    return {"ok": True, **result}
+
+
 @app.post("/api/events")
 def ingest_event(event: EventIn):
     payload = event.payload
@@ -161,25 +183,17 @@ def ingest_event(event: EventIn):
         raise HTTPException(400, "payload 为空：请提交 Avro record JSON "
                                 "（至少包含样品号、项目、测值字段）")
     try:
-        result = service.ingest_event(payload)
+        result = service.ingest_event(payload, source_key=event.source_key)
     except GuardError as exc:
         return _guard_response(exc, 422)
-
-    decodes = []
-    for analyzer_id in (event.decode_on or []):
-        if analyzer_id not in _analyzer_urls():
-            decodes.append({"analyzer_id": analyzer_id,
-                            "error": "unknown analyzer"})
-            continue
-        try:
-            decodes.append(service.decode_event(result["event_id"], analyzer_id))
-        except GuardError as exc:
-            decodes.append({"analyzer_id": analyzer_id, "error": str(exc)})
-        except Exception as exc:
-            decodes.append({"analyzer_id": analyzer_id,
-                            "error": f"decode call unconfirmed: {exc}"})
-    result["decodes"] = decodes
-    return {"ok": True, **result}
+    except SourceConflictError as exc:
+        return JSONResponse(
+            status_code=409,
+            content={"ok": False, "error": str(exc),
+                     "source_key": exc.source_key,
+                     "existing_event_id": exc.event_id,
+                     "deduplicated": False})
+    return _ingest_response(result, payload, event.decode_on)
 
 
 @app.post("/api/events/decode")

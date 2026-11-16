@@ -96,6 +96,9 @@ function renderEvents(s) {
   const tb = document.querySelector("#events-table tbody");
   tb.innerHTML = s.events.map((e) => `<tr>
       <td>${esc(e.id)}</td>
+      <td>${e.has_source_key
+        ? `<span class="pill">${esc(e.source_key)}</span>`
+        : '<span class="hint">（无键）</span>'}</td>
       <td>v${e.writer_version}<div class="pill">${esc(e.writer_fp.slice(0, 8))}</div></td>
       <td><pre>${esc(pretty(e.payload))}</pre></td>
       <td>${esc(e.ingested_at)}</td>
@@ -103,7 +106,7 @@ function renderEvents(s) {
         <button onclick="decodeNow('${esc(e.id)}','analyzer-a')">A 解码</button>
         <button onclick="decodeNow('${esc(e.id)}','analyzer-b')">B 解码</button>
       </td>
-    </tr>`).join("") || `<tr><td colspan="5" class="hint">尚无留存事件</td></tr>`;
+    </tr>`).join("") || `<tr><td colspan="6" class="hint">尚无留存事件</td></tr>`;
 }
 
 function renderDecodes(s) {
@@ -140,7 +143,18 @@ function showMsg(id, text, ok) {
 async function ingest(body) {
   try {
     const r = await api("/api/events", { method: "POST", body });
-    let msg = `事件已入仓：${r.event_id}（写入 v${r.writer_version}，${r.size_bytes} 字节 Avro）`;
+    let msg;
+    if (r.deduplicated) {
+      msg = `同键同内容：复用首次入仓事件 ${r.event_id}`
+          + `（首次写入 v${r.writer_version}，留存字节 ${r.size_bytes} Bytes，`
+          + `首次入仓 ${r.first_ingested_at}）`;
+    } else if (r.source_key) {
+      msg = `事件已入仓（新键）：${r.event_id}（写入 v${r.writer_version}，`
+          + `${r.size_bytes} 字节 Avro）`;
+    } else {
+      msg = `事件已入仓：${r.event_id}（写入 v${r.writer_version}，`
+          + `${r.size_bytes} 字节 Avro）`;
+    }
     for (const d of r.decodes || []) {
       msg += d.error
         ? `\n[${d.analyzer_id}] 解码失败: ${d.error}`
@@ -151,14 +165,25 @@ async function ingest(body) {
     showMsg("ingest-msg", msg, allOk);
     await refresh();
   } catch (e) {
-    showMsg("ingest-msg", "入仓被拒：" + e.message, false);
+    if (e.payload && e.payload.existing_event_id) {
+      showMsg("ingest-msg",
+        `同键不同内容，已拒绝且旧事件未改动。\n冲突键：${e.payload.source_key}`
+        + `\n首次事件号：${e.payload.existing_event_id}\n${e.message}`, false);
+    } else {
+      showMsg("ingest-msg", "入仓被拒：" + e.message, false);
+    }
   }
+}
+
+function sourceKeyOf(inputId) {
+  const v = ($(inputId).value || "").trim();
+  return v ? v : undefined;
 }
 
 $("btn-ingest-simple").onclick = () => {
   const raw = $("ev-measurement").value.trim();
   const measurement = Number(raw);
-  ingest({
+  const body = {
     sample_id: $("ev-sample").value,
     project: $("ev-project").value,
     measurement: Number.isFinite(measurement) ? measurement : raw,
@@ -166,18 +191,24 @@ $("btn-ingest-simple").onclick = () => {
       ...($("ev-dec-a").checked ? ["analyzer-a"] : []),
       ...($("ev-dec-b").checked ? ["analyzer-b"] : []),
     ],
-  });
+  };
+  const key = sourceKeyOf("ev-source-key");
+  if (key) body.source_key = key;
+  ingest(body);
 };
 $("btn-ingest-json").onclick = () => {
   try {
     const payload = JSON.parse($("ev-payload").value);
-    ingest({
+    const body = {
       payload,
       decode_on: [
         ...($("ev-dec-a").checked ? ["analyzer-a"] : []),
         ...($("ev-dec-b").checked ? ["analyzer-b"] : []),
       ],
-    });
+    };
+    const key = sourceKeyOf("ev-json-source-key");
+    if (key) body.source_key = key;
+    ingest(body);
   } catch (e) {
     showMsg("ingest-msg", "JSON 解析失败：" + e.message, false);
   }

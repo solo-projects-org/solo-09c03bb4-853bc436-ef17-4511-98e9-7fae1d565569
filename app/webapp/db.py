@@ -1,11 +1,12 @@
 """Persistence layer for the FastAPI web platform."""
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import time
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from ..avro_codec import DEFAULT_SCHEMA_V1, fingerprint
 from ..db_common import get_conn
@@ -31,7 +32,9 @@ CREATE TABLE IF NOT EXISTS events (
     writer_version      INTEGER NOT NULL,
     payload_json        TEXT NOT NULL,
     blob_b64            TEXT NOT NULL,
-    ingested_at         TEXT NOT NULL
+    ingested_at         TEXT NOT NULL,
+    source_key          TEXT,
+    content_fp          TEXT
 );
 CREATE TABLE IF NOT EXISTS writer_switches (
     switch_id           TEXT PRIMARY KEY,
@@ -84,6 +87,7 @@ def init(db_path: str) -> None:
     conn = get_conn(db_path)
     try:
         conn.executescript(_DDL)
+        _migrate_events(conn)
         fp = fingerprint(DEFAULT_SCHEMA_V1)
         conn.execute(
             "INSERT OR IGNORE INTO schema_versions(fp, kind, version, schema_json, created_at) "
@@ -101,6 +105,26 @@ def init(db_path: str) -> None:
         conn.commit()
     finally:
         conn.close()
+
+
+def _migrate_events(conn: sqlite3.Connection) -> None:
+    """Upgrade a pre-existing events table in place.
+
+    Older databases have no source-key columns. Rather than rebuilding the
+    table (which would change statement semantics under rebuild hazards), add
+    the columns and a partial unique index. Legacy rows get NULL source keys;
+    SQLite treats NULLs as distinct in a unique index, so every legacy event
+    stays untouched and remains decodable.
+    """
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(events)")}
+    if "source_key" not in cols:
+        conn.execute("ALTER TABLE events ADD COLUMN source_key TEXT")
+    if "content_fp" not in cols:
+        conn.execute("ALTER TABLE events ADD COLUMN content_fp TEXT")
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_events_source_key "
+        "ON events(source_key) WHERE source_key IS NOT NULL"
+    )
 
 
 # ----- schemas --------------------------------------------------------------
@@ -157,16 +181,84 @@ def set_writer_state(conn: sqlite3.Connection, fp: str, version: int) -> None:
 
 # ----- events ---------------------------------------------------------------
 
+def content_fingerprint(payload: Dict[str, Any]) -> str:
+    """Canonical identity of event JSON content.
+
+    Key order and whitespace do not matter. JSON numbers with the same
+    mathematical value compare equal (``1`` / ``1.0``), while booleans stay
+    distinct from numbers. This is what the gateway retry semantics need:
+    a re-serialised but identical event is a duplicate, not a conflict.
+    """
+    canonical = json.dumps(_normalise(payload), sort_keys=True,
+                           separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _normalise(value: Any) -> Any:
+    if isinstance(value, bool):
+        return {"$bool": value}
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, dict):
+        return {str(k): _normalise(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_normalise(v) for v in value]
+    return value
+
+
 def insert_event(conn: sqlite3.Connection, *, writer_fp: str, writer_version: int,
-                 payload: Dict[str, Any], blob_b64: str) -> str:
+                 payload: Dict[str, Any], blob_b64: str,
+                 source_key: Optional[str] = None,
+                 content_fp: Optional[str] = None) -> str:
     event_id = "evt_" + uuid.uuid4().hex[:12]
     conn.execute(
-        "INSERT INTO events(id, writer_fp, writer_version, payload_json, blob_b64, ingested_at) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO events(id, writer_fp, writer_version, payload_json, blob_b64, "
+        "ingested_at, source_key, content_fp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         (event_id, writer_fp, writer_version, json.dumps(payload, ensure_ascii=False),
-         blob_b64, _now()),
+         blob_b64, _now(), source_key, content_fp),
     )
     return event_id
+
+
+def insert_event_once(conn: sqlite3.Connection, *, writer_fp: str,
+                      writer_version: int, payload: Dict[str, Any],
+                      blob_b64: str, source_key: str, content_fp: str
+                      ) -> Tuple[Optional[str], Optional[sqlite3.Row]]:
+    """Idempotent insert guarded by the unique source key.
+
+    The write lock is taken with ``BEGIN IMMEDIATE`` before the existence
+    check, so concurrent same-key ingests (threads or processes) are
+    serialized and exactly one row survives. The caller must have committed
+    any prior read transaction on ``conn``.
+
+    Returns ``(event_id, None)`` when this call inserted the event, or
+    ``(None, existing_row)`` when the key was already present. The caller must
+    compare ``existing_row['content_fp']`` before treating the replay as a
+    duplicate; a differing payload is a conflict, not a duplicate.
+    """
+    conn.commit()  # end any implicit read transaction; BEGIN IMMEDIATE next
+    conn.execute("BEGIN IMMEDIATE")
+    existing = get_event_by_source_key(conn, source_key)
+    if existing is not None:
+        conn.commit()
+        return None, existing
+    event_id = "evt_" + uuid.uuid4().hex[:12]
+    conn.execute(
+        "INSERT INTO events(id, writer_fp, writer_version, payload_json, blob_b64, "
+        "ingested_at, source_key, content_fp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (event_id, writer_fp, writer_version,
+         json.dumps(payload, ensure_ascii=False), blob_b64, _now(),
+         source_key, content_fp),
+    )
+    conn.commit()
+    return event_id, None
+
+
+def get_event_by_source_key(conn: sqlite3.Connection,
+                            source_key: str) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM events WHERE source_key = ?", (source_key,)
+    ).fetchone()
 
 
 def list_events(conn: sqlite3.Connection) -> List[sqlite3.Row]:

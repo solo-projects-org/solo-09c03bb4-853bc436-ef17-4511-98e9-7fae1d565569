@@ -171,6 +171,44 @@ def main():
     check("no pending reader switches",
           all(s["status"] != "pending" for s in st["reader_switches"]))
 
+    # 12. source-event-key idempotency (gateway retry) on the live wire
+    first = web.post("/api/events", json={
+        "source_key": "smoke-gw-1",
+        "payload": {"sample_id": "K-1", "project": "P", "measurement": 1.0,
+                    "instrument_id": "GC-1", "tags": [], "batch_no": "B-1"},
+    }).json()
+    check("keyed first ingest is new",
+          first["ok"] and first["deduplicated"] is False
+          and first["source_key"] == "smoke-gw-1")
+    retry = web.post("/api/events", json={
+        "source_key": "smoke-gw-1",
+        "payload": {"batch_no": "B-1", "tags": [],
+                    "instrument_id": "GC-1", "measurement": 1.0,
+                    "project": "P", "sample_id": "K-1"},
+    }).json()
+    check("same key + same content returns first event",
+          retry["event_id"] == first["event_id"]
+          and retry["deduplicated"] is True
+          and retry["writer_version"] == first["writer_version"],
+          f"{first['event_id']} vs {retry['event_id']}")
+    conflict = web.post("/api/events", json={
+        "source_key": "smoke-gw-1",
+        "payload": {"sample_id": "K-1", "project": "P", "measurement": 2.0},
+    })
+    check("same key + different content rejected 409",
+          conflict.status_code == 409
+          and conflict.json()["existing_event_id"] == first["event_id"])
+    st = web.get("/api/status").json()
+    keyed = [e for e in st["events"] if e["source_key"] == "smoke-gw-1"]
+    check("rejected conflict did not add or modify a row",
+          len(keyed) == 1 and keyed[0]["id"] == first["event_id"])
+    deleted = web.post("/api/events", json={
+        "payload": {"sample_id": "K-1", "project": "P", "measurement": 1.0,
+                    "instrument_id": "GC-1", "tags": [], "batch_no": "B-1"}}).json()
+    check("keyless ingest still always inserts",
+          deleted["event_id"] != first["event_id"]
+          and deleted["source_key"] is None)
+
     print(f"\n{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0
 

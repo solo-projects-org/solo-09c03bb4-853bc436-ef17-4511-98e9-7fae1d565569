@@ -63,6 +63,10 @@
         <input id="ev-project" value="重金属普查"/>
         <label>测值 measurement</label>
         <input id="ev-measurement" value="3.14"/>
+        <label>全局来源事件键 source_key（可选）</label>
+        <input id="ev-source-key" placeholder="例如 gw-20261116-000123（网关重试用）"/>
+        <div class="hint">同键且 JSON 内容相同：返回首次事件号，不重复入仓、不改首条；
+          同键不同内容：拒绝且不改旧事件。留空则保持原有每次新增行为。</div>
         <label>提交后实际解码（可选，多选）</label>
         <div class="checkbox-row">
           <label><input type="checkbox" id="ev-dec-a"/> 分析服务 A</label>
@@ -73,6 +77,8 @@
       <div>
         <label>或直接提交完整 Avro record JSON（优先于左栏）</label>
         <textarea id="ev-payload" rows="8" placeholder='{"sample_id":"S-1","project":"P","measurement":1.0}'></textarea>
+        <label>JSON 提交也可选带 source_key</label>
+        <input id="ev-json-source-key" placeholder="留空则不启用去重"/>
         <button id="btn-ingest-json">按 JSON 提交</button>
       </div>
     </div>
@@ -109,7 +115,7 @@
     <h2>⑤ 留存事件与解码结果</h2>
     <h3>仓内事件（含写入时格式版本）</h3>
     <table id="events-table">
-      <thead><tr><th>事件 ID</th><th>写入版本</th><th>载荷 JSON</th><th>入仓时间</th><th>操作</th></tr></thead>
+      <thead><tr><th>事件 ID</th><th>来源事件键</th><th>写入版本</th><th>载荷 JSON</th><th>入仓时间</th><th>操作</th></tr></thead>
       <tbody></tbody>
     </table>
     <h3>最近解码结果</h3>

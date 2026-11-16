@@ -39,7 +39,7 @@ from __future__ import annotations
 import base64
 import json
 import threading
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from ..avro_codec import (CodecError, SchemaError, encode, fingerprint,
                           parse_schema, roundtrip_check)
@@ -50,6 +50,20 @@ from .analyzer_client import ANALYZER_ORDER, AnalyzerClient, RemoteError
 
 class GuardError(Exception):
     """A precondition/compatibility guard rejected the request."""
+
+
+class SourceConflictError(Exception):
+    """A global source key was reused with different event content.
+
+    The first event is never modified; callers surface this as a rejection.
+    """
+
+    def __init__(self, source_key: str, event_id: str):
+        super().__init__(
+            f"source_key '{source_key}' already belongs to event {event_id} "
+            "with different content; the retained event was not changed")
+        self.source_key = source_key
+        self.event_id = event_id
 
 
 class SwitchService:
@@ -440,28 +454,102 @@ class SwitchService:
     # Event ingestion / decoding
     # ======================================================================
 
-    def ingest_event(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+    def ingest_event(self, payload: Dict[str, Any],
+                     source_key: Optional[str] = None) -> Dict[str, Any]:
         """Encode with the *currently effective* write format and retain it.
 
         Works regardless of any pending switch: only the confirmed effective
         writer pointer is ever used, so interleaved compatible events are never
-        blocked or missed."""
+        blocked or missed.
+
+        With an optional global ``source_key`` the insert is idempotent: a
+        retry with byte-for-byte identical JSON content (canonically compared)
+        returns the *first* event and leaves its retained blob, writer format
+        and version untouched. The key is resolved against the stored row
+        inside one transaction, so a retry arriving after the write format has
+        switched is still judged by the original content and never re-encoded.
+        Reusing the key with different content is rejected and the original
+        event is not modified."""
+        source_key = (source_key or "").strip() or None
+        if source_key is not None and len(source_key) > 255:
+            raise GuardError("source_key 过长（最多 255 字符）")
+
+        if source_key is None:
+            # No key: preserve the original always-insert behaviour exactly.
+            with self._conn() as conn:
+                state = db.get_writer_state(conn)
+                writer_schema = db.get_schema_by_fp(conn, state["effective_fp"])
+            blob = self._encode_or_reject(writer_schema, payload)
+            blob_b64 = base64.b64encode(blob).decode("ascii")
+            with self._conn() as conn:
+                event_id = db.insert_event(
+                    conn, writer_fp=state["effective_fp"],
+                    writer_version=state["effective_version"],
+                    payload=payload, blob_b64=blob_b64)
+                conn.commit()
+            return {"event_id": event_id,
+                    "writer_version": state["effective_version"],
+                    "writer_fp": state["effective_fp"],
+                    "size_bytes": len(blob),
+                    "source_key": None, "deduplicated": False}
+
+        content_fp = db.content_fingerprint(payload)
+
+        # Resolve the key against the retained row *before* encoding. A retry
+        # that arrives after a write-format switch is therefore still judged
+        # by the first event's content and never re-encoded/re-blobbed; it also
+        # keeps working when the newer writer could not encode the old datum.
+        with self._conn() as conn:
+            existing = db.get_event_by_source_key(conn, source_key)
+        if existing is not None:
+            return self._replay(existing, source_key, content_fp)
+
         with self._conn() as conn:
             state = db.get_writer_state(conn)
             writer_schema = db.get_schema_by_fp(conn, state["effective_fp"])
+        blob = self._encode_or_reject(writer_schema, payload)
+        blob_b64 = base64.b64encode(blob).decode("ascii")
+
+        with self._conn() as conn:
+            # One write transaction: the unique index on source_key makes a
+            # concurrent same-key insert leave exactly one row.
+            event_id, existing = db.insert_event_once(
+                conn, writer_fp=state["effective_fp"],
+                writer_version=state["effective_version"], payload=payload,
+                blob_b64=blob_b64, source_key=source_key,
+                content_fp=content_fp)
+            if existing is not None:
+                return self._replay(existing, source_key, content_fp)
+            return {"event_id": event_id,
+                    "writer_version": state["effective_version"],
+                    "writer_fp": state["effective_fp"],
+                    "size_bytes": len(blob), "source_key": source_key,
+                    "deduplicated": False}
+
+    @staticmethod
+    def _encode_or_reject(writer_schema: Dict[str, Any],
+                          payload: Dict[str, Any]) -> bytes:
         try:
-            blob = encode(writer_schema, payload)
+            return encode(writer_schema, payload)
         except CodecError as exc:
             raise GuardError(str(exc))
-        blob_b64 = base64.b64encode(blob).decode("ascii")
-        with self._conn() as conn:
-            event_id = db.insert_event(
-                conn, writer_fp=state["effective_fp"],
-                writer_version=state["effective_version"],
-                payload=payload, blob_b64=blob_b64)
-            conn.commit()
-        return {"event_id": event_id, "writer_version": state["effective_version"],
-                "writer_fp": state["effective_fp"], "size_bytes": len(blob)}
+
+    @staticmethod
+    def _replay(existing, source_key: str,
+                content_fp: str) -> Dict[str, Any]:
+        """Return the retained first event for an identical replay.
+
+        The stored blob/format/version are reported verbatim; a replay with
+        different content is a conflict and leaves the first event untouched.
+        """
+        if existing["content_fp"] != content_fp:
+            raise SourceConflictError(source_key, existing["id"])
+        return {"event_id": existing["id"],
+                "writer_version": existing["writer_version"],
+                "writer_fp": existing["writer_fp"],
+                "size_bytes": len(base64.b64decode(existing["blob_b64"])),
+                "source_key": source_key, "deduplicated": True,
+                "first_ingested_at": existing["ingested_at"]}
 
     def decode_event(self, event_id: str, analyzer_id: str) -> Dict[str, Any]:
         if analyzer_id not in self.clients:
@@ -500,6 +588,7 @@ class SwitchService:
             for e in events:
                 e["payload"] = json.loads(e.pop("payload_json"))
                 e.pop("blob_b64", None)
+                e["has_source_key"] = bool(e.get("source_key"))
             wsw = [self._writer_switch_view(r)
                    for r in conn.execute(
                        "SELECT * FROM writer_switches ORDER BY rowid DESC LIMIT 10")]
